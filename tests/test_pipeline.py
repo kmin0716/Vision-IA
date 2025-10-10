@@ -1,0 +1,1 @@
+#Test global pour valider que l’ensemble du pipeline (PDF → IA → résultat) fonctionne sans erreur.

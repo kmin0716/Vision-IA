@@ -1,0 +1,1 @@
+# Module responsable de la conversion des fichiers PDF en images (via PyMuPDF).

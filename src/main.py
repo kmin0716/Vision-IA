@@ -1,0 +1,1 @@
+# Point d’entrée principal du projet (exécute le pipeline complet depuis la ligne de commande).

@@ -1,0 +1,1 @@
+# Module qui enchaîne toutes les étapes : PDF → images → modèle → réponse finale.

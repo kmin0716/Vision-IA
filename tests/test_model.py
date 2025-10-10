@@ -1,0 +1,1 @@
+# Test unitaire pour vérifier que le modèle IA se charge et génère une réponse basique.

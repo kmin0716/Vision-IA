@@ -1,0 +1,1 @@
+# Liste des dépendances Python nécessaires au projet (transformers, torch, pymupdf, etc.)

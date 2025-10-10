@@ -1,0 +1,1 @@
+# Test unitaire pour vérifier que la conversion PDF → images fonctionne correctement.
