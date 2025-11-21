@@ -1,4 +1,4 @@
-# Module qui enchaîne toutes les étapes : PDF → images → modèle → réponse finale.
+# Orchestration : PDF → images → Qwen3-VL → fichiers
 
 from __future__ import annotations
 from pathlib import Path
@@ -29,29 +29,24 @@ def run_pipeline(
     # 1) PDF -> PNG
     png_paths = pdf_to_images(pdf_path, images_dir, dpi=dpi)
 
-    # 2) Analyse par InternVL (une page = une question)
-    analyzer = InternVLAnalyzer()
+    # 2) Analyse par Qwen3-VL (2B)
+    analyzer = InternVLAnalyzer(model_id="Qwen/Qwen3-VL-2B-Instruct")
     results = analyzer.analyze_batch(png_paths, question)
 
-    # 3) Sauvegarde JSON + TXT
+    # 3) Sauvegardes
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = pdf_path.stem
     json_path = outputs_dir / f"{base_name}_analysis_{stamp}.json"
-    txt_path = outputs_dir / f"{base_name}_analysis_{stamp}.txt"
+    txt_path  = outputs_dir / f"{base_name}_analysis_{stamp}.txt"
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "pdf": str(pdf_path),
-                "dpi": dpi,
-                "question": question,
-                "pages": results,
-                "created_at": stamp,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump({
+            "pdf": str(pdf_path),
+            "dpi": dpi,
+            "question": question,
+            "pages": results,
+            "created_at": stamp,
+        }, f, ensure_ascii=False, indent=2)
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(f"PDF: {pdf_path}\nDPI: {dpi}\nQuestion: {question}\n\n")

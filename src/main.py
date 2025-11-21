@@ -1,5 +1,4 @@
-# Point d'entrée principal du projet (exécute le pipeline complet depuis la ligne de commande).
-# Point d'entrée principal du projet (exécute le pipeline complet depuis la ligne de commande).
+# Version optimisée avec barre de progression détaillée
 
 from __future__ import annotations
 import argparse
@@ -7,265 +6,369 @@ from pathlib import Path
 import json
 from datetime import datetime
 import os
+import time
 
 import torch
 from PIL import Image
-import pymupdf  # alias: fitz
+import pymupdf
 
-# (Optionnel) éviter l'usage des fast tokenizers sur Windows anciennes configs
 os.environ.setdefault("TRANSFORMERS_NO_FAST_TOKENIZER", "1")
 
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoProcessor, AutoModelForVision2Seq
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    raise ImportError("Installe qwen-vl-utils : pip install qwen-vl-utils")
+
+# Pour la barre de progression
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    print("💡 Pour avoir une belle barre de progression : pip install tqdm")
 
 
-# ============================================================
-#   1) Conversion PDF -> images (via PyMuPDF)
-# ============================================================
+# ============ Barre de progression personnalisée ============
 
-def pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 192):
-    """
-    Convertit chaque page du PDF en PNG.
-    - dpi: 192 est un bon compromis qualité/poids (72 * 2.666...).
-    """
+class ProgressTracker:
+    """Affiche la progression en temps réel."""
+    
+    def __init__(self, total: int, desc: str = "Traitement"):
+        self.total = total
+        self.desc = desc
+        self.current = 0
+        self.start_time = time.time()
+        
+    def update(self, page_num: int):
+        """Met à jour la progression."""
+        self.current = page_num
+        elapsed = time.time() - self.start_time
+        
+        if self.current > 0:
+            avg_time = elapsed / self.current
+            remaining = avg_time * (self.total - self.current)
+            eta_str = f"{int(remaining//60)}min {int(remaining%60)}s"
+        else:
+            eta_str = "calcul..."
+        
+        percent = (self.current / self.total) * 100
+        bar_length = 40
+        filled = int(bar_length * self.current / self.total)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        
+        print(f"\r{self.desc} [{bar}] {percent:.1f}% | "
+              f"Page {self.current}/{self.total} | "
+              f"Temps: {int(elapsed)}s | "
+              f"ETA: {eta_str}", end="", flush=True)
+    
+    def finish(self):
+        """Affiche la completion."""
+        elapsed = time.time() - self.start_time
+        print(f"\r{self.desc} [{'█'*40}] 100% | "
+              f"{self.total}/{self.total} pages | "
+              f"Terminé en {int(elapsed)}s ({elapsed/self.total:.1f}s/page)")
+        print()
+
+
+# ============ 1) PDF -> images avec progression ============
+
+def pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 150):
+    """Convertit chaque page du PDF en PNG avec barre de progression."""
     out_dir.mkdir(parents=True, exist_ok=True)
     doc = pymupdf.open(pdf_path)
     zoom = dpi / 72.0
     mat = pymupdf.Matrix(zoom, zoom)
     png_paths = []
-
-    for i, page in enumerate(doc, start=1):
+    
+    total_pages = len(doc)
+    
+    if HAS_TQDM:
+        iterator = tqdm(enumerate(doc, start=1), 
+                       total=total_pages,
+                       desc="📄 Conversion PDF",
+                       unit="page",
+                       colour="blue")
+    else:
+        print(f"📄 Conversion de {total_pages} pages...")
+        iterator = enumerate(doc, start=1)
+    
+    for i, page in iterator:
         pix = page.get_pixmap(matrix=mat, alpha=False)
         out_path = out_dir / f"{pdf_path.stem}_p{i:03d}.png"
         pix.save(out_path.as_posix())
         png_paths.append(out_path)
-
+        
+        if not HAS_TQDM:
+            print(f"  ✓ Page {i}/{total_pages}")
+    
     doc.close()
     return png_paths
 
 
-# ============================================================
-#   2) Analyse des images avec InternVL 3.5 (Transformers)
-# ============================================================
+# ============ 2) Analyse avec Qwen3-VL et progression ============
 
 def analyze_images(model_id: str, image_paths, question: str):
-    """
-    Analyse chaque image avec le modèle InternVL 3.5 (checkpoint -HF),
-    en utilisant le processor et le chat template natifs.
-    """
+    """Analyse avec barre de progression détaillée."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    print(f"   🔧 Device: {device}, dtype: {dtype}")
-
-    # Charger processor et modèle (pas besoin de tokenizer manuel ni de patchs)
-    print("   📦 Chargement du processor...")
-    processor = AutoProcessor.from_pretrained(model_id)
-
-    print("   📦 Chargement du modèle...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
-
-    # Déplacer le modèle sur le bon device
-    model = model.to(device)
+    print(f"\n🔧 Configuration :")
+    print(f"   • Device : {device}")
+    print(f"   • Dtype  : {dtype}")
+    print(f"   • Modèle : {model_id}")
+    
+    print("\n📦 Chargement du modèle...")
+    load_start = time.time()
+    
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    
+    if device == "cuda":
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            dtype=dtype,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            dtype=dtype,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+    
     model.eval()
-    print(f"   ✅ Modèle chargé avec succès sur {device}\n")
+    load_time = time.time() - load_start
+    print(f"✅ Modèle chargé en {load_time:.1f}s\n")
 
     results = []
     total = len(image_paths)
+    
+    # Barre de progression
+    if HAS_TQDM:
+        iterator = tqdm(enumerate(sorted(image_paths), start=1),
+                       total=total,
+                       desc="🤖 Analyse VLM",
+                       unit="page",
+                       colour="green")
+    else:
+        print(f"🤖 Analyse de {total} pages...\n")
+        tracker = ProgressTracker(total, "🤖 Analyse")
+        iterator = enumerate(sorted(image_paths), start=1)
 
-    for i, img_path in enumerate(sorted(image_paths), start=1):
-        print(f"   📄 Traitement page {i}/{total}...", end=" ", flush=True)
-
-        # Charger l'image
+    analysis_times = []
+    
+    for i, img_path in iterator:
+        page_start = time.time()
+        
         image = Image.open(img_path).convert("RGB")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": question},
+            ],
+        }]
 
-        # Messages format chat (le processor gère la mise en forme + les balises image)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": question},
-                ],
-            }
-        ]
-
-        # 1) Construire le prompt textuel via le template
         prompt = processor.apply_chat_template(
             messages,
-            add_generation_prompt=True
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
-        # 2) Préparer les tenseurs pour le modèle (texte + image)
+        image_inputs, video_inputs = process_vision_info(messages)
         inputs = processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt"
+            text=[prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        # 3) Déplacer les inputs sur le bon device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # 4) Génération
         with torch.inference_mode():
-            output_ids = model.generate(
+            out_ids = model.generate(
                 **inputs,
-                max_new_tokens=512,
-                do_sample=False
+                max_new_tokens=800,
+                do_sample=False,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
             )
 
-        # 5) Ne décoder que la partie générée (après le prompt)
-        gen_only = output_ids[0, inputs["input_ids"].shape[1]:]
-        text = processor.decode(gen_only, skip_special_tokens=True).strip()
+        gen_only = out_ids[0, inputs["input_ids"].shape[1]:]
+        text = processor.batch_decode(
+            [gen_only],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )[0].strip()
 
-        results.append({"page": i, "answer": text})
-        print("✅")
-
+        page_time = time.time() - page_start
+        analysis_times.append(page_time)
+        
+        results.append({
+            "page": i,
+            "answer": text,
+            "processing_time_seconds": round(page_time, 2)
+        })
+        
+        if not HAS_TQDM:
+            tracker.update(i)
+    
+    if not HAS_TQDM:
+        tracker.finish()
+    
+    # Statistiques finales
+    avg_time = sum(analysis_times) / len(analysis_times)
+    total_time = sum(analysis_times)
+    print(f"\n📊 Statistiques :")
+    print(f"   • Temps moyen/page : {avg_time:.1f}s")
+    print(f"   • Temps total      : {int(total_time//60)}min {int(total_time%60)}s")
+    print(f"   • Page la plus rapide : {min(analysis_times):.1f}s")
+    print(f"   • Page la plus lente  : {max(analysis_times):.1f}s")
+    
     return results
 
 
-# ============================================================
-#   3) Pipeline complet (CLI)
-# ============================================================
+# ============ 3) CLI orchestration ============
 
 def main():
-    """Orchestration du pipeline: PDF -> Images -> Analyse -> Sauvegarde"""
-
     parser = argparse.ArgumentParser(
-        description="Analyse de PDF avec InternVL 3.5 (Transformers + PyMuPDF)",
+        description="Analyse PDF électronique avec barre de progression",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemples d'utilisation:
-  py src/main.py
-  py src/main.py --pdf data/input_pdfs/mon_document.pdf
-  py src/main.py --pdf rapport.pdf --dpi 300 --question "Résume cette page"
-        """
     )
 
     parser.add_argument(
-        "--pdf",
-        type=str,
-        default="data/input_pdfs/evolution_pib_france.pdf",
+        "--pdf", type=str, default="data/input_pdfs/aop_facile.pdf",
         help="Chemin vers le fichier PDF à analyser"
     )
-
+    parser.add_argument("--dpi", type=int, default=150, help="DPI de rendu (150 recommandé)")
+    parser.add_argument("--images_dir", type=str, default="data/page_images")
+    parser.add_argument("--outputs_dir", type=str, default="data/outputs")
     parser.add_argument(
-        "--dpi",
-        type=int,
-        default=192,
-        help="Résolution de conversion des pages (default: 192)"
+        "--model", type=str, default="Qwen/Qwen3-VL-2B-Instruct",
+        help="Modèle HuggingFace"
     )
-
     parser.add_argument(
-        "--images_dir",
-        type=str,
-        default="data/page_images",
-        help="Dossier de sortie pour les images"
-    )
-
-    parser.add_argument(
-        "--outputs_dir",
-        type=str,
-        default="data/outputs",
-        help="Dossier de sortie pour les résultats"
-    )
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="OpenGVLab/InternVL3_5-1B-HF",   # important: checkpoint -HF
-        help="Modèle HuggingFace à utiliser"
-    )
-
-    parser.add_argument(
-        "--question",
-        type=str,
+        "--question", type=str,
         default=(
-            "Analyse le contenu de cette page : résume le texte principal, "
-            "décris les graphiques ou tableaux présents, et cite 3 informations "
-            "clés avec leurs valeurs numériques."
+            "Tu es un expert en électronique. Analyse cette page d'exercices.\n\n"
+            "RÈGLES IMPORTANTES :\n"
+            "- N'utilise JAMAIS de notation LaTeX (pas de \\(, \\), \\frac, etc.)\n"
+            "- Écris les formules en texte simple : G = -R2/R1 = -45/2.5 = -18\n"
+            "- Fais TOUS les calculs numériques étape par étape\n"
+            "- Donne le résultat final avec l'unité\n\n"
+            "Pour chaque exercice visible :\n"
+            "1. Type de circuit : [nom du circuit]\n"
+            "2. Composants : R1 = [valeur], R2 = [valeur], etc.\n"
+            "3. Formule : [formule en texte simple]\n"
+            "4. Calcul : [étapes détaillées]\n"
+            "5. Résultat final : [valeur avec unité]\n\n"
+            "Exemple de bonne réponse :\n"
+            "Exercice 1 - Amplificateur inverseur\n"
+            "- R1 = 2.5 kΩ\n"
+            "- R2 = 45 kΩ\n"
+            "- Formule du gain : G = -R2/R1\n"
+            "- Calcul : G = -45/2.5 = -18\n"
+            "- Résultat : Le gain est de -18 (sans unité)"
         ),
-        help="Question/prompt à poser au modèle pour chaque page"
+        help="Question posée au modèle"
     )
 
     args = parser.parse_args()
 
-    # Préparation des chemins
     pdf_path = Path(args.pdf)
     images_dir = Path(args.images_dir)
     outputs_dir = Path(args.outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Vérifier l'existence du PDF
     if not pdf_path.exists():
         print(f"❌ Erreur : Le fichier {pdf_path} n'existe pas !")
         return
 
-    print("\n" + "=" * 70)
-    print("🚀 DÉMARRAGE DE L'ANALYSE PDF")
-    print("=" * 70)
-    print(f"📁 Fichier : {pdf_path.name}")
+    # Header
+    print("\n" + "╔" + "═" * 68 + "╗")
+    print("║" + " " * 20 + "🚀 ANALYSE PDF ÉLECTRONIQUE" + " " * 21 + "║")
+    print("╚" + "═" * 68 + "╝")
+    print(f"\n📄 Fichier : {pdf_path.name}")
     print(f"🤖 Modèle  : {args.model}")
     print(f"📊 DPI     : {args.dpi}")
-    print("=" * 70 + "\n")
+    print(f"⏰ Début   : {datetime.now().strftime('%H:%M:%S')}")
+    print("─" * 70)
 
-    # Étape 1 : Conversion PDF -> Images
-    print("📘 ÉTAPE 1/3 : Conversion du PDF en images...")
+    total_start = time.time()
+
+    # Étape 1 : PDF -> images
+    print("\n" + "=" * 70)
+    print("📘 ÉTAPE 1/3 : Conversion du PDF en images")
+    print("=" * 70)
     try:
         images = pdf_to_images(pdf_path, images_dir, dpi=args.dpi)
-        print(f"✅ {len(images)} pages converties avec succès\n")
+        print(f"✅ {len(images)} pages converties avec succès")
     except Exception as e:
         print(f"❌ Erreur lors de la conversion : {e}")
         return
 
     # Étape 2 : Analyse
-    print("🤖 ÉTAPE 2/3 : Analyse des pages avec le modèle Vision AI...")
+    print("\n" + "=" * 70)
+    print("🤖 ÉTAPE 2/3 : Analyse avec Qwen3-VL-2B-Instruct")
+    print("=" * 70)
     try:
         results = analyze_images(args.model, images, args.question)
-        print(f"✅ Analyse terminée : {len(results)} pages traitées\n")
+        print(f"\n✅ Analyse terminée : {len(results)} pages traitées")
     except Exception as e:
         print(f"\n❌ Erreur lors de l'analyse : {e}")
-        print("💡 Vérifie que tu utilises bien :")
-        print("   - transformers >= 4.45 (idéalement 4.48+)")
-        print("   - le checkpoint '-HF' (ex: OpenGVLab/InternVL3_5-1B-HF)")
-        print("   - pillow & torchvision installés")
-        print("   Commande suggérée :")
-        print('   py -m pip install -U "transformers>=4.48.0" "accelerate>=0.34.0" "safetensors>=0.4.5" pillow torchvision')
+        import traceback
+        traceback.print_exc()
         return
 
-    # Étape 3 : Sauvegarde des résultats
-    print("💾 ÉTAPE 3/3 : Sauvegarde des résultats...")
+    # Étape 3 : Sauvegarde
+    print("\n" + "=" * 70)
+    print("💾 ÉTAPE 3/3 : Sauvegarde des résultats")
+    print("=" * 70)
+    
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = outputs_dir / f"{pdf_path.stem}_analysis_{stamp}.json"
-    txt_path = outputs_dir / f"{pdf_path.stem}_analysis_{stamp}.txt"
+    txt_path  = outputs_dir / f"{pdf_path.stem}_analysis_{stamp}.txt"
 
-    # JSON
+    # JSON avec métadonnées
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "pdf": pdf_path.name,
+            "model": args.model,
+            "dpi": args.dpi,
+            "question": args.question,
+            "total_processing_time_seconds": round(time.time() - total_start, 2),
+            "pages": results,
+            "timestamp": stamp,
+        }, f, ensure_ascii=False, indent=2)
 
     # TXT lisible
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(f"ANALYSE DU PDF : {pdf_path.name}\n")
-        f.write(f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+        f.write(f"ANALYSE ÉLECTRONIQUE : {pdf_path.name}\n")
         f.write(f"Modèle : {args.model}\n")
-        f.write(f"Question : {args.question}\n")
+        f.write(f"Date   : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+        f.write(f"Temps total : {int((time.time()-total_start)//60)}min {int((time.time()-total_start)%60)}s\n")
         f.write("=" * 70 + "\n\n")
+        
         for r in results:
             f.write(f"{'=' * 70}\n")
-            f.write(f"PAGE {r['page']}\n")
-            f.write(f"{'=' * 70}\n")
+            f.write(f"PAGE {r['page']} (traité en {r['processing_time_seconds']}s)\n")
+            f.write(f"{'=' * 70}\n\n")
             f.write(f"{r['answer']}\n\n")
 
-    print("✅ Résultats sauvegardés :")
+    total_time = time.time() - total_start
+    
+    print(f"✅ Résultats sauvegardés :")
     print(f"   📄 JSON : {json_path}")
     print(f"   📝 TXT  : {txt_path}")
-
-    print("\n" + "=" * 70)
-    print("🎉 ANALYSE TERMINÉE AVEC SUCCÈS !")
-    print("=" * 70 + "\n")
+    
+    print("\n" + "╔" + "═" * 68 + "╗")
+    print("║" + " " * 23 + "🎉 ANALYSE TERMINÉE !" + " " * 24 + "║")
+    print("╚" + "═" * 68 + "╝")
+    print(f"\n⏱️  Temps total : {int(total_time//60)} min {int(total_time%60)} s")
+    print(f"📊 Vitesse moyenne : {total_time/len(results):.1f}s par page")
+    print()
 
 
 if __name__ == "__main__":
